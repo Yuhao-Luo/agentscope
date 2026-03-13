@@ -3,7 +3,7 @@ import json
 import random
 import re
 from collections import Counter
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 import agentscope
@@ -476,6 +476,15 @@ async def ask_for_target_number(agent, prompt_text: str, valid_targets: set[str]
 
 
 async def ask_for_short_speech(agent, prompt_text: str, max_retries: int = MAX_RETRY):
+    return await ask_for_short_speech_with_validator(agent, prompt_text, None, max_retries=max_retries)
+
+
+async def ask_for_short_speech_with_validator(
+    agent,
+    prompt_text: str,
+    validator: Optional[Callable[[str], Optional[str]]] = None,
+    max_retries: int = MAX_RETRY,
+):
     for _ in range(max_retries):
         resp = await agent(Msg("DM", prompt_text, "system"))
         text = resp.content.strip()
@@ -486,6 +495,12 @@ async def ask_for_short_speech(agent, prompt_text: str, max_retries: int = MAX_R
                 Msg("DM", "当前是发言阶段，不是投票阶段。请用 1 到 3 句话表达看法，不要只输出数字。", "system"),
             )
             continue
+
+        if validator is not None:
+            invalid_reason = validator(text)
+            if invalid_reason is not None:
+                await safe_add_memory(agent, Msg("DM", invalid_reason, "system"))
+                continue
 
         if text:
             return text
@@ -548,19 +563,14 @@ def judge_winner(alive_players, role_assignment):
     alive_name_set = {p.name for p in alive_players}
 
     alive_wolves = [n for n in alive_name_set if role_assignment[n] == "狼人"]
-    alive_gods = [n for n in alive_name_set if role_assignment[n] in {"预言家", "女巫"}]
-    alive_villagers = [n for n in alive_name_set if role_assignment[n] == "村民"]
+    alive_good = [n for n in alive_name_set if role_assignment[n] != "狼人"]
 
     # 狼人死光，好人赢
     if len(alive_wolves) == 0:
         return "good"
 
-    # 屠神：神职死光，狼人赢
-    if len(alive_gods) == 0:
-        return "wolf"
-
-    # 屠民：村民死光，狼人赢
-    if len(alive_villagers) == 0:
+    # 标准胜利条件：狼人数量达到或超过好人数量，狼人赢
+    if len(alive_wolves) >= len(alive_good):
         return "wolf"
 
     return None
@@ -580,6 +590,20 @@ async def wolf_discussion_phase(wolves, alive_players, role_assignment, game_sta
     public_summary = build_public_summary(game_state, alive_name_set)
     discussion_records = []
 
+    def build_night_validator():
+        def _validator(speech: str) -> Optional[str]:
+            if game_state["round_id"] == 1 and re.search(r"昨天|昨晚|前一天|上一轮|上轮", speech):
+                return "这是第一夜，不存在前一天的公开发言与投票。请只基于当前已知信息重说。"
+            return None
+
+        return _validator
+
+    first_night_hint = (
+        "这是第一夜，场上还没有任何白天发言和投票历史。\n"
+        if game_state["round_id"] == 1
+        else ""
+    )
+
     async with MsgHub(
         participants=wolves,
         announcement=Msg(
@@ -589,11 +613,13 @@ async def wolf_discussion_phase(wolves, alive_players, role_assignment, game_sta
         ),
     ):
         for wolf in wolves:
-            speech = await ask_for_short_speech(
+            speech = await ask_for_short_speech_with_validator(
                 wolf,
                 f"当前存活玩家：{sorted(alive_name_set)}。\n"
+                f"{first_night_hint}"
                 f"白天关键公开信息如下：\n{public_summary}\n"
                 "请结合这些信息发言，分析谁像真预言家、谁在带队、今晚优先刀谁。1 到 3 句话。",
+                validator=build_night_validator(),
             )
             discussion_records.append((wolf.name, speech))
             print_player_line(wolf.name, speech, role_assignment)
@@ -757,6 +783,23 @@ async def day_speech_phase(alive_players, dead_players, role_assignment, game_st
     public_summary = build_public_summary(game_state, alive_name_set)
 
     speeches = []
+    spoken_players = set()
+
+    def build_day_validator(current_speaker: str):
+        def _validator(speech: str) -> Optional[str]:
+            if game_state["round_id"] == 1 and re.search(r"昨天|前一天|上一轮|上轮", speech):
+                return "这是第一天，不存在更早一轮白天发言。请基于已公开信息发言。"
+
+            for mentioned_name, _ in re.findall(r"(player\d+).{0,6}(发言|说|提到)", speech):
+                if mentioned_name != current_speaker and mentioned_name not in spoken_players:
+                    return (
+                        f"当前轮次里 {mentioned_name} 还未发言，不能提前引用其发言。"
+                        "请改为基于已公开信息表达怀疑。"
+                    )
+
+            return None
+
+        return _validator
 
     async with MsgHub(
         participants=alive_players,
@@ -767,15 +810,18 @@ async def day_speech_phase(alive_players, dead_players, role_assignment, game_st
         ),
     ):
         for speaker in alive_players:
-            speech = await ask_for_short_speech(
+            speech = await ask_for_short_speech_with_validator(
                 speaker,
                 f"当前是第 {game_state['round_id']} 轮白天。\n"
                 f"当前存活玩家：{sorted(alive_name_set)}。\n"
                 f"公开关键信息总结：\n{public_summary}\n"
+                f"本轮已完成发言顺序：{[name for name, _ in speeches] if speeches else ['暂无']}。\n"
                 "请轮到你发言。你只能基于已经公开的信息发言，不能编造前几轮不存在的信息。"
                 "不能怀疑自己。请用 1 到 3 句话表达你的怀疑、判断或站边。",
+                validator=build_day_validator(speaker.name),
             )
             speeches.append((speaker.name, speech))
+            spoken_players.add(speaker.name)
             print_player_line(speaker.name, speech, role_assignment)
 
             claims = extract_public_claims(speaker.name, speech)
