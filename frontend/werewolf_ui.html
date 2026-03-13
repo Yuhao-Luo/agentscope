@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Werewolf 控制台</title>
+  <link rel="stylesheet" href="./werewolf_ui.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>🐺 Werewolf 游戏前端界面</h1>
+    <div class="pill" id="phase-pill">阶段：第1夜</div>
+  </header>
+
+  <main class="layout">
+    <section class="card span-2">
+      <h2>日夜进程</h2>
+      <ul id="timeline" class="timeline"></ul>
+    </section>
+
+    <section class="card">
+      <h2>夜晚狼人刀人信息</h2>
+      <div id="wolf-kill" class="content-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>讨论信息（夜间简报）</h2>
+      <div id="night-discussion" class="content-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>预言家验人信息</h2>
+      <div id="seer-checks" class="content-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>女巫用药信息</h2>
+      <div id="witch-actions" class="content-list"></div>
+    </section>
+
+    <section class="card span-2">
+      <h2>白天讨论信息</h2>
+      <div id="day-discussion" class="content-list"></div>
+    </section>
+
+    <section class="card span-2">
+      <h2>投票信息</h2>
+      <table>
+        <thead>
+          <tr><th>玩家</th><th>投给</th><th>理由</th></tr>
+        </thead>
+        <tbody id="vote-table"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <section class="card control-panel">
+    <h2>快速录入（演示）</h2>
+    <div class="controls">
+      <input id="speaker" placeholder="玩家名，如 player1" />
+      <input id="speech" placeholder="发言内容" />
+      <button id="add-day-talk">新增白天发言</button>
+      <button id="next-phase">推进到下一阶段</button>
+    </div>
+  </section>
+
+  <script src="./werewolf_ui.js"></script>
+</body>
+</html>
