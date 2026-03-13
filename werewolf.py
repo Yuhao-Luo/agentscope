@@ -1,7 +1,10 @@
 import asyncio
+import base64
+import hashlib
 import json
 import random
 import re
+import struct
 from collections import Counter
 from typing import Callable, Optional
 
@@ -28,6 +31,11 @@ ROLE_DECK = ["狼人"] * 2 + ["预言家"] + ["女巫"] + ["村民"] * 4
 
 MAX_RETRY = 3
 
+ENABLE_REALTIME_WS = True
+REALTIME_WS_HOST = "0.0.0.0"
+REALTIME_WS_PORT = 8765
+REALTIME_WS_PATH = "/ws"
+
 
 # =========================
 # 打印工具
@@ -51,6 +59,143 @@ def print_player_line(name: str, text: str, role_assignment: dict):
 
 def print_action(name: str, text: str, role_assignment: dict):
     print(f"{role_tag(name, role_assignment)}: {text}")
+
+
+class RealtimeEventHub:
+    def __init__(self, host: str, port: int, path: str, enabled: bool = True):
+        self.host = host
+        self.port = port
+        self.path = path
+        self.enabled = enabled
+        self._clients = set()
+        self._server = None
+
+    async def start(self):
+        if not self.enabled:
+            print_dm("实时推流：已关闭。")
+            return
+
+        self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        print_dm(f"实时推流已启动：ws://{self.host}:{self.port}{self.path}")
+
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+            header_text = data.decode("utf-8", errors="ignore")
+            lines = header_text.split("\r\n")
+            if not lines:
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            req = lines[0].split(" ")
+            if len(req) < 2:
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            req_path = req[1]
+            if req_path != self.path:
+                writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            headers = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+
+            ws_key = headers.get("sec-websocket-key")
+            if not ws_key:
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            accept = base64.b64encode(
+                hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("utf-8")).digest()
+            ).decode("utf-8")
+
+            resp = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode("utf-8")
+            writer.write(resp)
+            await writer.drain()
+
+            self._clients.add(writer)
+
+            while not reader.at_eof():
+                frame_header = await reader.readexactly(2)
+                second = frame_header[1]
+                masked = (second & 0x80) != 0
+                length = second & 0x7F
+                if length == 126:
+                    length = int.from_bytes(await reader.readexactly(2), "big")
+                elif length == 127:
+                    length = int.from_bytes(await reader.readexactly(8), "big")
+
+                if masked:
+                    mask_key = await reader.readexactly(4)
+                    payload = await reader.readexactly(length)
+                    _ = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+                else:
+                    await reader.readexactly(length)
+
+        except Exception:
+            pass
+        finally:
+            self._clients.discard(writer)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _encode_text_frame(payload: str) -> bytes:
+        data = payload.encode("utf-8")
+        length = len(data)
+        if length <= 125:
+            header = bytes([0x81, length])
+        elif length <= 65535:
+            header = bytes([0x81, 126]) + struct.pack("!H", length)
+        else:
+            header = bytes([0x81, 127]) + struct.pack("!Q", length)
+        return header + data
+
+    async def broadcast(self, event: dict):
+        if not self.enabled or not self._clients:
+            return
+
+        payload = json.dumps(event, ensure_ascii=False)
+        frame = self._encode_text_frame(payload)
+        dead = []
+        for writer in list(self._clients):
+            try:
+                writer.write(frame)
+                await writer.drain()
+            except Exception:
+                dead.append(writer)
+
+        for writer in dead:
+            self._clients.discard(writer)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def stop(self):
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+        self._clients.clear()
 
 
 # =========================
@@ -580,7 +725,7 @@ def judge_winner(alive_players, role_assignment):
 # 夜晚阶段
 # =========================
 
-async def wolf_discussion_phase(wolves, alive_players, role_assignment, game_state):
+async def wolf_discussion_phase(wolves, alive_players, role_assignment, game_state, realtime_hub: RealtimeEventHub):
     if not wolves:
         return []
 
@@ -623,11 +768,18 @@ async def wolf_discussion_phase(wolves, alive_players, role_assignment, game_sta
             )
             discussion_records.append((wolf.name, speech))
             print_player_line(wolf.name, speech, role_assignment)
+            await realtime_hub.broadcast({
+                "type": "speech",
+                "round": game_state["round_id"],
+                "phase": "夜晚狼人讨论",
+                "speaker": wolf.name,
+                "text": speech,
+            })
 
     return discussion_records
 
 
-async def wolf_vote_phase(wolves, alive_players, role_assignment, game_state):
+async def wolf_vote_phase(wolves, alive_players, role_assignment, game_state, realtime_hub: RealtimeEventHub):
     alive_name_set = set(alive_names(alive_players))
     wolf_names = {w.name for w in wolves}
     valid_targets = alive_name_set - wolf_names
@@ -651,6 +803,13 @@ async def wolf_vote_phase(wolves, alive_players, role_assignment, game_state):
         if target is not None:
             votes.append(target)
             print_action(wolf.name, f"刀 {target}", role_assignment)
+            await realtime_hub.broadcast({
+                "type": "vote",
+                "round": game_state["round_id"],
+                "phase": "夜晚狼人投票",
+                "from": wolf.name,
+                "to": target,
+            })
 
     target = most_common_or_none(votes)
     if target is None:
@@ -662,7 +821,7 @@ async def wolf_vote_phase(wolves, alive_players, role_assignment, game_state):
     return target
 
 
-async def seer_action_phase(alive_players, role_assignment, game_state):
+async def seer_action_phase(alive_players, role_assignment, game_state, realtime_hub: RealtimeEventHub):
     seers = [p for p in alive_players if role_assignment[p.name] == "预言家"]
     if not seers:
         return None
@@ -699,10 +858,18 @@ async def seer_action_phase(alive_players, role_assignment, game_state):
         "result": result,
     })
 
+    await realtime_hub.broadcast({
+        "type": "seer_check",
+        "round": game_state["round_id"],
+        "seer": seer.name,
+        "target": target,
+        "result": result,
+    })
+
     return {"seer": seer.name, "target": target, "result": result}
 
 
-async def witch_action_phase(alive_players, role_assignment, killed_target_name, game_state):
+async def witch_action_phase(alive_players, role_assignment, killed_target_name, game_state, realtime_hub: RealtimeEventHub):
     witches = [p for p in alive_players if role_assignment[p.name] == "女巫"]
     if not witches:
         return {"save": False, "poison_target": None}
@@ -722,26 +889,44 @@ async def witch_action_phase(alive_players, role_assignment, killed_target_name,
     if action["save"] and game_state["witch_antidote_available"]:
         game_state["witch_antidote_available"] = False
         print_action(witch.name, "救", role_assignment)
+        await realtime_hub.broadcast({
+            "type": "witch_action",
+            "round": game_state["round_id"],
+            "action": "救",
+            "target": killed_target_name,
+        })
 
     elif action["poison_target"] is not None and game_state["witch_poison_available"]:
         game_state["witch_poison_available"] = False
         print_action(witch.name, f"毒 {action['poison_target']}", role_assignment)
+        await realtime_hub.broadcast({
+            "type": "witch_action",
+            "round": game_state["round_id"],
+            "action": f"毒{action['poison_target']}",
+            "target": action["poison_target"],
+        })
 
     else:
         print_action(witch.name, "不行动", role_assignment)
+        await realtime_hub.broadcast({
+            "type": "witch_action",
+            "round": game_state["round_id"],
+            "action": "不行动",
+        })
 
     return action
 
 
-async def run_night_round(dm, players, alive_players, role_assignment, game_state):
+async def run_night_round(dm, players, alive_players, role_assignment, game_state, realtime_hub: RealtimeEventHub):
     print_section("天黑请闭眼")
+    await realtime_hub.broadcast({"type": "phase", "round": game_state["round_id"], "phase": "第%d夜" % game_state["round_id"]})
 
     wolves = [p for p in alive_players if role_assignment[p.name] == "狼人"]
 
-    await wolf_discussion_phase(wolves, alive_players, role_assignment, game_state)
-    wolf_kill_target = await wolf_vote_phase(wolves, alive_players, role_assignment, game_state)
-    await seer_action_phase(alive_players, role_assignment, game_state)
-    witch_action = await witch_action_phase(alive_players, role_assignment, wolf_kill_target, game_state)
+    await wolf_discussion_phase(wolves, alive_players, role_assignment, game_state, realtime_hub)
+    wolf_kill_target = await wolf_vote_phase(wolves, alive_players, role_assignment, game_state, realtime_hub)
+    await seer_action_phase(alive_players, role_assignment, game_state, realtime_hub)
+    witch_action = await witch_action_phase(alive_players, role_assignment, wolf_kill_target, game_state, realtime_hub)
 
     final_deaths = set()
     if wolf_kill_target is not None:
@@ -768,6 +953,20 @@ async def run_night_round(dm, players, alive_players, role_assignment, game_stat
     else:
         print_dm("夜晚结束。无人死亡。")
 
+    for p in dead_players:
+        await realtime_hub.broadcast({
+            "type": "player_status",
+            "round": game_state["round_id"],
+            "player": p.name,
+            "alive": False,
+        })
+
+    await realtime_hub.broadcast({
+        "type": "wolf_kill",
+        "round": game_state["round_id"],
+        "target": wolf_kill_target,
+    })
+
     return dead_players, new_alive_players
 
 
@@ -775,7 +974,7 @@ async def run_night_round(dm, players, alive_players, role_assignment, game_stat
 # 白天阶段
 # =========================
 
-async def day_speech_phase(alive_players, dead_players, role_assignment, game_state):
+async def day_speech_phase(alive_players, dead_players, role_assignment, game_state, realtime_hub: RealtimeEventHub):
     print("\n【白天发言】")
 
     alive_name_set = set(alive_names(alive_players))
@@ -823,6 +1022,13 @@ async def day_speech_phase(alive_players, dead_players, role_assignment, game_st
             speeches.append((speaker.name, speech))
             spoken_players.add(speaker.name)
             print_player_line(speaker.name, speech, role_assignment)
+            await realtime_hub.broadcast({
+                "type": "speech",
+                "round": game_state["round_id"],
+                "phase": "白天讨论",
+                "speaker": speaker.name,
+                "text": speech,
+            })
 
             claims = extract_public_claims(speaker.name, speech)
             for c in claims:
@@ -832,7 +1038,7 @@ async def day_speech_phase(alive_players, dead_players, role_assignment, game_st
     return speeches
 
 
-async def day_vote_phase(alive_players, role_assignment, game_state):
+async def day_vote_phase(alive_players, role_assignment, game_state, realtime_hub: RealtimeEventHub):
     print_section("开始投票")
 
     alive_name_set = set(alive_names(alive_players))
@@ -856,6 +1062,13 @@ async def day_vote_phase(alive_players, role_assignment, game_state):
         if target is not None:
             votes.append(target)
             print_player_line(voter.name, target.replace("player", ""), role_assignment)
+            await realtime_hub.broadcast({
+                "type": "vote",
+                "round": game_state["round_id"],
+                "phase": "白天投票",
+                "from": voter.name,
+                "to": target,
+            })
 
     print_section("投票结束")
 
@@ -868,14 +1081,15 @@ async def day_vote_phase(alive_players, role_assignment, game_state):
     return target
 
 
-async def run_day_round(dm, alive_players, dead_players, role_assignment, game_state):
+async def run_day_round(dm, alive_players, dead_players, role_assignment, game_state, realtime_hub: RealtimeEventHub):
     print_section("天亮了")
+    await realtime_hub.broadcast({"type": "phase", "round": game_state["round_id"], "phase": "第%d天" % game_state["round_id"]})
 
     dead_text = "、".join([p.name for p in dead_players]) if dead_players else "无人"
     print_dm(f"昨夜死亡：{dead_text}")
 
-    await day_speech_phase(alive_players, dead_players, role_assignment, game_state)
-    executed_name = await day_vote_phase(alive_players, role_assignment, game_state)
+    await day_speech_phase(alive_players, dead_players, role_assignment, game_state, realtime_hub)
+    executed_name = await day_vote_phase(alive_players, role_assignment, game_state, realtime_hub)
 
     if executed_name is None:
         return alive_players, None
@@ -895,6 +1109,12 @@ async def run_day_round(dm, alive_players, dead_players, role_assignment, game_s
     })
 
     print_dm(f"{role_tag(executed_name, role_assignment)} 被流放。")
+    await realtime_hub.broadcast({
+        "type": "player_status",
+        "round": game_state["round_id"],
+        "player": executed_name,
+        "alive": False,
+    })
     return new_alive_players, executed_player
 
 
@@ -904,6 +1124,14 @@ async def run_day_round(dm, alive_players, dead_players, role_assignment, game_s
 
 async def run_conversation():
     agentscope.init(project="rolePlay_test")
+
+    realtime_hub = RealtimeEventHub(
+        host=REALTIME_WS_HOST,
+        port=REALTIME_WS_PORT,
+        path=REALTIME_WS_PATH,
+        enabled=ENABLE_REALTIME_WS,
+    )
+    await realtime_hub.start()
 
     dm, players = await init_agents()
     role_assignment = assign_roles(players)
@@ -929,6 +1157,20 @@ async def run_conversation():
         f"{ROLE_DECK.count('村民')} 名村民。现在进入第一夜。"
     )
 
+    await realtime_hub.broadcast({
+        "type": "phase",
+        "round": 1,
+        "phase": "第1夜",
+    })
+
+    for p in players:
+        await realtime_hub.broadcast({
+            "type": "player_status",
+            "round": 1,
+            "player": p.name,
+            "alive": True,
+        })
+
     alive_players = list(players)
 
     while True:
@@ -944,6 +1186,7 @@ async def run_conversation():
             alive_players=alive_players,
             role_assignment=role_assignment,
             game_state=game_state,
+            realtime_hub=realtime_hub,
         )
 
         winner = judge_winner(alive_players, role_assignment)
@@ -956,6 +1199,7 @@ async def run_conversation():
             dead_players=dead_players,
             role_assignment=role_assignment,
             game_state=game_state,
+            realtime_hub=realtime_hub,
         )
 
         if executed_player is not None:
@@ -979,6 +1223,13 @@ async def run_conversation():
     print("\n【最终身份表】")
     for p in players:
         print(f"{p.name} -> {role_assignment[p.name]}")
+
+    await realtime_hub.broadcast({
+        "type": "phase",
+        "phase": "游戏结束",
+        "winner": winner,
+    })
+    await realtime_hub.stop()
 
 
 if __name__ == "__main__":
