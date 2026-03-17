@@ -1,0 +1,16 @@
+{
+  "title": "AI 基础办公超级智能体 BETA 上手实测",
+  "content": "今天把一个基础办公超级智能体跑起来了。它现在能做网页搜索、天气查询、文本文件读写、插入内容、执行 shell 命令，还能顺手帮我整理成适合发布的小红书文案。接下来准备继续补工作流编排和自动发帖。",
+  "images": [
+    "D:/replace-with-your-image-1.jpg",
+    "D:/replace-with-your-image-2.jpg"
+  ],
+  "topics": [
+    "AI办公",
+    "AgentScope",
+    "效率工具",
+    "小红书自动化"
+  ],
+  "mode": "draft",
+  "location": ""
+}
